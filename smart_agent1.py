@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""smartctl emulation of Zabbix agent 2 smartdisk plugin keys (for agent 1)."""
+import json, os, subprocess, sys, datetime
+
+TIMEOUT = 20
+INCLUDE_UNSUPPORTED = os.environ.get("SMART_INCLUDE_UNSUPPORTED") == "1"
+LOGFILE = os.environ.get("SMART_AGENT1_LOG")  # set to a path for debugging
+SUDO = [] if subprocess.run(["id", "-un"], capture_output=True, text=True).stdout.strip() == "root" else ["sudo", "-n"]
+
+def log(msg):
+    if LOGFILE is None:
+        return
+    try:
+        with open(LOGFILE, "a") as f:
+            f.write("%s uid=%s %s\n" % (datetime.datetime.now(), os.getuid(), msg))
+    except Exception:
+        pass
+
+def smartctl_json(path, raidtype=None):
+    cmd = SUDO + ["smartctl", "--json", "--all", path]
+    if raidtype:
+        cmd[1:1] = ["-d", raidtype]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT)
+        return json.loads(p.stdout), p.returncode
+    except Exception as e:
+        log("smartctl_json(%s,%s) EXC %r" % (path, raidtype, e))
+        return None, 255
+
+def discover():
+    try:
+        p = subprocess.run(["lsblk", "-d", "-n", "-o", "NAME,TYPE"], capture_output=True, text=True, timeout=10)
+        lines = p.stdout.splitlines()
+    except Exception as e:
+        log("lsblk EXC %r" % e)
+        lines = []
+    items = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 2 or parts[1] != "disk" or parts[0].startswith("sr"):
+            continue
+        name, path = parts[0], "/dev/" + parts[0]
+        dtype, raid = ("nvme", "") if name.startswith("nvme") else ("ata", "")
+        j, rc = smartctl_json(path, raid or None)
+        if j is None or "json_format_version" not in j:
+            continue
+        smart_ok = (j.get("smart_support", {}).get("available", False)
+                    or "nvme_smart_health_information_log" in j
+                    or "ata_smart_attributes" in j
+                    or "scsi_grown_defect_list" in j
+                    or j.get("smart_status", {}))
+        if not smart_ok and not INCLUDE_UNSUPPORTED:
+            continue
+        attrs = ",".join(a.get("name") or a.get("attribute_name") or ""
+                         for a in j.get("ata_smart_attributes", {}).get("table", []))
+        items.append({"{#NAME}": name, "{#PATH}": path, "{#DISKTYPE}": dtype,
+                      "{#RAIDTYPE}": raid, "{#ATTRIBUTES}": attrs})
+    log("discover -> %d items" % len(items))
+    return items
+
+def attr(tbl, name):
+    for a in tbl:
+        if (a.get("name") or a.get("attribute_name")) == name:
+            return {"value": int(a.get("raw", {}).get("value") or a.get("value") or 0),
+                    "worst": int(a.get("worst") or 0), "threshold": int(a.get("threshold") or 0)}
+    return {"value": 0, "worst": 0, "threshold": 0}
+
+def get(path, raidtype=None):
+    j, rc = smartctl_json(path, raidtype)
+    res = {"exit_status": rc, "error": ""}
+    if j is None:
+        res["error"] = "smartctl: no JSON output"
+        log("get(%s) FAILED" % path)
+        return res
+    if "json_format_version" not in j:
+        res["error"] = str(j.get("smartctl", {}).get("message_string", "unknown error"))
+        return res
+    if j.get("smartctl", {}).get("message_string") and rc:
+        res["error"] = j["smartctl"]["message_string"]
+    nvme = j.get("nvme_smart_health_information_log", {})
+    ata = j.get("ata_smart_attributes", {}).get("table", [])
+    res["model_name"] = j.get("model_name") or j.get("scsi_model_name", "unknown")
+    res["serial_number"] = j.get("serial_number", "unknown")
+    res["firmware_version"] = j.get("firmware_version", "")
+    res["power_on_time"] = int(j.get("power_on_time", {}).get("hours") or 0)
+    pcc_top = int(j.get("power_cycle_count") or 0)
+    res["power_cycle_count_top"] = pcc_top
+    res["temperature"] = int(j.get("temperature", {}).get("current") or 0)
+    res["critical_warning"] = int(nvme.get("critical_warning") or 0)
+    res["percentage_used"] = int(nvme.get("percentage_used") or 0)
+    res["media_errors"] = int(nvme.get("media_errors") or j.get("scsi_error_counter_log", {}).get("read", {}).get("errors_corrected_by_eccfast", 0) or 0)
+    res["self_test_passed"] = "yes"
+    stl = j.get("self_test", {}).get("self_test_log", [])
+    if stl:
+        last = stl[0]
+        status = (last.get("status") or {}).get("string", "") if isinstance(last.get("status"), dict) else str(last.get("status", ""))
+        if ("completed" not in status.lower() and "never started" not in status.lower()) or last.get("lba_of_first_error"):
+            res["self_test_passed"] = "no"
+    for out, src in [("raw_read_error_rate", "Raw_Read_Error_Rate"), ("spin_up_time", "Spin_Up_Time"),
+                     ("start_stop_count", "Start_Stop_Count"), ("reallocated_sector_ct", "Reallocated_Sector_Ct"),
+                     ("seek_error_rate", "Seek_Error_Rate"), ("reported_uncorrect", "Reported_Uncorrect"),
+                     ("command_timeout", "Command_Timeout"), ("program_fail_count_chip", "Program_Fail_Count_Chip"),
+                     ("bad_block_rate", "Bad_Block_Rate"),
+                     ("power_cycle_count", "Power_Cycle_Count")]:
+        res[out] = attr(ata, src)
+    if res["power_cycle_count"]["value"] == 0 and pcc_top:
+        res["power_cycle_count"]["value"] = pcc_top
+    log("get(%s,%s) ok es=%s model=%s" % (path, raidtype, rc, res["model_name"]))
+    return res
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "discovery"
+    log("main argv=%r" % sys.argv)
+    if mode == "discovery":
+        print(json.dumps(discover()))
+    elif mode == "get":
+        raid = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] not in ("", "auto", "undefined") else None
+        print(json.dumps(get(sys.argv[2], raid)))
+    else:
+        print(json.dumps({"error": "bad mode: " + mode}))
+
+if __name__ == "__main__":
+    main()
