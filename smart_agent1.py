@@ -27,20 +27,54 @@ def smartctl_json(path, raidtype=None):
         log("smartctl_json(%s,%s) EXC %r" % (path, raidtype, e))
         return None, 255
 
-def discover():
-    try:
-        p = subprocess.run(["lsblk", "-d", "-n", "-o", "NAME,TYPE"], capture_output=True, text=True, timeout=10)
-        lines = p.stdout.splitlines()
-    except Exception as e:
-        log("lsblk EXC %r" % e)
-        lines = []
-    items = []
-    for line in lines:
+def list_disks_linux():
+    p = subprocess.run(["lsblk", "-d", "-n", "-o", "NAME,TYPE"],
+                       capture_output=True, text=True, timeout=10)
+    out = []
+    for line in p.stdout.splitlines():
         parts = line.split()
-        if len(parts) < 2 or parts[1] != "disk" or parts[0].startswith("sr"):
-            continue
-        name, path = parts[0], "/dev/" + parts[0]
-        dtype, raid = ("nvme", "") if name.startswith("nvme") else ("ata", "")
+        if len(parts) >= 2 and parts[1] == "disk" and not parts[0].startswith("sr"):
+            out.append(parts[0])
+    return out
+
+
+def list_disks_bsd():
+    # geom disk list prints only whole disks (no partitions); skip optical (cd*)
+    p = subprocess.run(["geom", "disk", "list"], capture_output=True, text=True, timeout=10)
+    out = []
+    for line in p.stdout.splitlines():
+        m = line.strip()
+        if m.startswith("1. Name: "):
+            name = m[len("1. Name: "):].strip()
+            if "." in name or name.startswith("cd"):
+                continue  # multipath suffix / optical
+            out.append(name)
+    return out
+
+
+def bsd_dtype(name):
+    if name.startswith(("nda", "nvd", "nvme")):
+        return "nvme"
+    if name.startswith("ada"):
+        return "ata"
+    return "scsi"
+
+
+def discover():
+    is_bsd = sys.platform.startswith("freebsd") or sys.platform.startswith("dragonfly")
+    try:
+        names = list_disks_bsd() if is_bsd else list_disks_linux()
+    except Exception as e:
+        log("disk listing EXC %r" % e)
+        names = []
+    items = []
+    for name in names:
+        path = "/dev/" + name
+        if is_bsd:
+            dtype = bsd_dtype(name)
+        else:
+            dtype = "nvme" if name.startswith("nvme") else "ata"
+        raid = ""
         j, rc = smartctl_json(path, raid or None)
         if j is None or "json_format_version" not in j:
             continue

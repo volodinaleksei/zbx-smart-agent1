@@ -79,10 +79,19 @@ Or on the server: host → items → filter `smart.` — all items should be
 
 ## Verified on
 
-| Host | Agent | smartmontools | Disk | Result |
-|---|---|---|---|---|
-| Ubuntu 24.04 VM (QEMU) | 7.0.32 | 7.4 | virtual sda, no SMART | 8 items, state 0 |
-| Ubuntu 26.04 | 7.4.16 | 7.5 | Kingston SA400S37120G | 12 items incl. attributes, state 0 |
+| Host | OS | Agent | smartmontools | Disk | Result |
+|---|---|---|---|---|---|
+| VM (QEMU) | Ubuntu 24.04 | 7.0.32 | 7.4 | virtual sda, no SMART | 8 items, state 0 |
+| vibestation | Ubuntu 26.04 | 7.4.16 | 7.5 | Kingston SA400S37120G | 12 items incl. attributes, state 0 |
+
+## FreeBSD notes
+
+Discovery uses `geom disk list` instead of `lsblk` (auto-detected via `sys.platform`).
+Device naming: `ada*` → ata, `nda*/nvd*` → nvme, `da*` → scsi; `cd*` (optical) skipped.
+Agent config lives in `/usr/local/etc/zabbixXX/zabbix_agentd.d/`; sudoers file goes to
+`/usr/local/etc/sudoers.d/`. NVMe devices on FreeBSD may need `smartctl -d nvme` — the
+`{#RAIDTYPE}` LLD macro covers this: edit the template's discovery command or set
+`{#RAIDTYPE}` override if your NVMe disks are not auto-detected.
 
 ## License
 
