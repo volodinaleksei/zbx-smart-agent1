@@ -66,6 +66,33 @@ def bsd_dtype(name):
     return "scsi"
 
 
+import re as _re
+
+
+def bsd_candidates(name):
+    """Yield (path, raidtype) probe candidates for a BSD disk name.
+
+    NVMe on FreeBSD: smartctl cannot open the da-like node /dev/ndaX
+    ("INQUIRY failed"); SMART must be read from the controller node
+    /dev/nvmeX (or /dev/nvmeXnsN) with -d nvme. Yield direct path first,
+    then controller equivalents.
+    """
+    yield ("/dev/" + name, "")
+    m = _re.match(r"(?:nda|nvd|nvme)(\d+)$", name)
+    if m:
+        idx = m.group(1)
+        yield ("/dev/nvme" + idx, "nvme")
+        yield ("/dev/nvme" + idx + "ns1", "nvme")
+
+
+def is_smart_ok(j):
+    return bool(j.get("smart_support", {}).get("available", False)
+                or "nvme_smart_health_information_log" in j
+                or "ata_smart_attributes" in j
+                or "scsi_grown_defect_list" in j
+                or j.get("smart_status", {}))
+
+
 def discover():
     is_bsd = sys.platform.startswith("freebsd") or sys.platform.startswith("dragonfly")
     try:
@@ -75,22 +102,31 @@ def discover():
         names = []
     items = []
     for name in names:
-        path = "/dev/" + name
         if is_bsd:
             dtype = bsd_dtype(name)
         else:
             dtype = "nvme" if name.startswith("nvme") else "ata"
-        raid = ""
-        j, rc = smartctl_json(path, raid or None)
-        if j is None or "json_format_version" not in j:
-            continue
-        smart_ok = (j.get("smart_support", {}).get("available", False)
-                    or "nvme_smart_health_information_log" in j
-                    or "ata_smart_attributes" in j
-                    or "scsi_grown_defect_list" in j
-                    or j.get("smart_status", {}))
-        if not smart_ok and not INCLUDE_UNSUPPORTED:
-            continue
+        found = None
+        if is_bsd:
+            # probe path candidates; for NVMe the working node is the
+            # controller (/dev/nvmeX), not /dev/ndaX
+            for probe_path, probe_raid in bsd_candidates(name):
+                j, rc = smartctl_json(probe_path, probe_raid or None)
+                if j is not None and "json_format_version" in j and is_smart_ok(j):
+                    found = (probe_path, probe_raid, j)
+                    break
+            if found is None:
+                continue
+            path, raid, j = found
+        else:
+            path, raid = "/dev/" + name, ""
+            j, rc = smartctl_json(path, raid or None)
+            if j is None or "json_format_version" not in j:
+                continue
+            if not is_smart_ok(j) and not INCLUDE_UNSUPPORTED:
+                continue
+        if dtype == "nvme" and "nvme" not in path and not raid:
+            raid = "nvme"
         attrs = ",".join(a.get("name") or a.get("attribute_name") or ""
                          for a in j.get("ata_smart_attributes", {}).get("table", []))
         items.append({"{#NAME}": name, "{#PATH}": path, "{#DISKTYPE}": dtype,
@@ -107,6 +143,17 @@ def attr(tbl, name):
 
 def get(path, raidtype=None):
     j, rc = smartctl_json(path, raidtype)
+    if (j is not None and "json_format_version" in j and not is_smart_ok(j)
+            and (sys.platform.startswith("freebsd") or sys.platform.startswith("dragonfly"))):
+        # direct node opened but no SMART (INQUIRY failed on nda*) — try controller nodes
+        name = os.path.basename(path)
+        for probe_path, probe_raid in bsd_candidates(name):
+            if probe_path == path:
+                continue
+            j2, rc2 = smartctl_json(probe_path, probe_raid or None)
+            if j2 is not None and "json_format_version" in j2 and is_smart_ok(j2):
+                j, rc = j2, rc2
+                break
     res = {"exit_status": rc, "error": ""}
     if j is None:
         res["error"] = "smartctl: no JSON output"
@@ -159,19 +206,19 @@ def main():
             print("disk listing EXC:", repr(e)); names = []
         print("disk names:", names)
         for n in names:
-            p = "/dev/" + n
-            j, rc = smartctl_json(p)
-            if j is None:
-                print(n, "-> smartctl FAILED (no JSON, rc=%s)" % rc)
-                continue
-            ok = (j.get("smart_support", {}).get("available", False)
-                  or "nvme_smart_health_information_log" in j
-                  or "ata_smart_attributes" in j
-                  or "scsi_grown_defect_list" in j or j.get("smart_status", {}))
-            print(n, "-> rc=%s smart_ok=%s top_keys=%s" % (rc, bool(ok), sorted(j.keys())))
-            if not ok:
-                print(n, "   smart_support:", j.get("smart_support"))
-                print(n, "   messages:", j.get("smartctl", {}).get("messages"))
+            probes = list(bsd_candidates(n)) if is_bsd else [("/dev/" + n, "")]
+            for p, r in probes:
+                j, rc = smartctl_json(p, r or None)
+                if j is None:
+                    print(n, "-> smartctl FAILED (no JSON, rc=%s)" % rc)
+                    continue
+                ok = is_smart_ok(j)
+                print("%s (%s,%s) -> rc=%s smart_ok=%s model=%s" % (
+                    n, p, r or "-", rc, ok, j.get("model_name", "-")))
+                if not ok:
+                    print("   messages:", j.get("smartctl", {}).get("messages"))
+                if ok:
+                    break
         return
     log("main argv=%r" % sys.argv)
     if mode == "discovery":
