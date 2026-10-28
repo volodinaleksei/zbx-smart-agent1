@@ -19,13 +19,19 @@ def log(msg):
 def smartctl_json(path, raidtype=None):
     cmd = SUDO + ["smartctl", "--json", "--all", path]
     if raidtype:
-        cmd[1:1] = ["-d", raidtype]
+        cmd[len(SUDO) + 1:len(SUDO) + 1] = ["-d", raidtype]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT)
-        return json.loads(p.stdout), p.returncode
+        j = json.loads(p.stdout)
     except Exception as e:
         log("smartctl_json(%s,%s) EXC %r" % (path, raidtype, e))
         return None, 255
+    # FreeBSD: /dev/nda* (NVMe) is not auto-detected ("Unable to detect device
+    # type") — retry once with -d nvme. {#RAIDTYPE} is filled by caller anyway.
+    if (raidtype is None and p.returncode
+            and "Unable to detect device type" in json.dumps(j.get("smartctl", {}))):
+        return smartctl_json(path, "nvme")
+    return j, p.returncode
 
 def list_disks_linux():
     p = subprocess.run(["lsblk", "-d", "-n", "-o", "NAME,TYPE"],
@@ -144,6 +150,29 @@ def get(path, raidtype=None):
 
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "discovery"
+    if mode == "debug":
+        is_bsd = sys.platform.startswith("freebsd") or sys.platform.startswith("dragonfly")
+        print("platform:", sys.platform, "is_bsd:", is_bsd)
+        try:
+            names = list_disks_bsd() if is_bsd else list_disks_linux()
+        except Exception as e:
+            print("disk listing EXC:", repr(e)); names = []
+        print("disk names:", names)
+        for n in names:
+            p = "/dev/" + n
+            j, rc = smartctl_json(p)
+            if j is None:
+                print(n, "-> smartctl FAILED (no JSON, rc=%s)" % rc)
+                continue
+            ok = (j.get("smart_support", {}).get("available", False)
+                  or "nvme_smart_health_information_log" in j
+                  or "ata_smart_attributes" in j
+                  or "scsi_grown_defect_list" in j or j.get("smart_status", {}))
+            print(n, "-> rc=%s smart_ok=%s top_keys=%s" % (rc, bool(ok), sorted(j.keys())))
+            if not ok:
+                print(n, "   smart_support:", j.get("smart_support"))
+                print(n, "   messages:", j.get("smartctl", {}).get("messages"))
+        return
     log("main argv=%r" % sys.argv)
     if mode == "discovery":
         print(json.dumps(discover()))
