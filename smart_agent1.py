@@ -141,6 +141,23 @@ def attr(tbl, name):
                     "worst": int(a.get("worst") or 0), "threshold": int(a.get("threshold") or 0)}
     return {"value": 0, "worst": 0, "threshold": 0}
 
+def ata_percentage_used(j):
+    """Percentage Used Endurance Indicator из ATA Device Statistics (GP Log 0x04)."""
+    for page in j.get("ata_device_statistics", {}).get("pages", []):
+        name = (page.get("name") or "").lower()
+        if page.get("number") == 7 or "solid state" in name:
+            for e in page.get("table", []):
+                en = (e.get("name") or "").lower()
+                if "percentage used" in en or "endurance indicator" in en:
+                    v = e.get("value")
+                    if isinstance(v, dict):
+                        v = v.get("value")
+                    try:
+                        return int(v or 0)
+                    except (TypeError, ValueError):
+                        return 0
+    return 0
+
 def get(path, raidtype=None):
     j, rc = smartctl_json(path, raidtype)
     if (j is not None and "json_format_version" in j and not is_smart_ok(j)
@@ -175,6 +192,8 @@ def get(path, raidtype=None):
     res["temperature"] = int(j.get("temperature", {}).get("current") or 0)
     res["critical_warning"] = int(nvme.get("critical_warning") or 0)
     res["percentage_used"] = int(nvme.get("percentage_used") or 0)
+    if res["percentage_used"] == 0:
+        res["percentage_used"] = ata_percentage_used(j)
     res["media_errors"] = int(nvme.get("media_errors") or j.get("scsi_error_counter_log", {}).get("read", {}).get("errors_corrected_by_eccfast", 0) or 0)
     res["self_test_passed"] = "yes"
     stl = j.get("self_test", {}).get("self_test_log", [])
