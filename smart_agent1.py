@@ -148,7 +148,10 @@ def ata_percentage_used(j):
         if page.get("number") == 7 or "solid state" in name:
             for e in page.get("table", []):
                 en = (e.get("name") or "").lower()
-                if "percentage used" in en or "endurance indicator" in en:
+                # entry offset 0x008 is the authoritative position of
+                # "Percentage Used Endurance Indicator" in page 7 (smartmontools
+                # ataprint.cpp); match name OR offset in case the name is absent
+                if e.get("offset") == 8 or "percentage" in en or "endurance" in en:
                     v = e.get("value")
                     if isinstance(v, dict):
                         v = v.get("value")
@@ -156,6 +159,26 @@ def ata_percentage_used(j):
                         return int(v or 0)
                     except (TypeError, ValueError):
                         return 0
+    return 0
+
+def vendor_percentage_used(tbl):
+    """Last resort: vendor SMART wear attributes (drives without Device
+    Statistics page 7 — e.g. many consumer SATA SSDs). Use the NORMALIZED
+    value: per ATA spec it is "higher = better", so these attributes all
+    start at 100 and count down -> used = 100 - value. (Raw encoding is
+    inconsistent across vendors: raw is % used on Intel/Micron 202 but
+    % remaining on Kingston 231, so raw must not be used here.)"""
+    for name in ("Percent_Lifetime_Remain", "Percent_Lifetime_Usage",
+                 "SSD_Life_Left", "Media_Wearout_Indicator",
+                 "Percent_Utilization_of_Rated_Life"):
+        for a in tbl:
+            if (a.get("name") or a.get("attribute_name")) == name:
+                try:
+                    v = int(a.get("value") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= v <= 100:
+                    return 100 - v
     return 0
 
 def get(path, raidtype=None):
@@ -194,6 +217,8 @@ def get(path, raidtype=None):
     res["percentage_used"] = int(nvme.get("percentage_used") or 0)
     if res["percentage_used"] == 0:
         res["percentage_used"] = ata_percentage_used(j)
+    if res["percentage_used"] == 0:
+        res["percentage_used"] = vendor_percentage_used(ata)
     res["media_errors"] = int(nvme.get("media_errors") or j.get("scsi_error_counter_log", {}).get("read", {}).get("errors_corrected_by_eccfast", 0) or 0)
     res["self_test_passed"] = "yes"
     stl = j.get("self_test", {}).get("self_test_log", [])
