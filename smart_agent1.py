@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """smartctl emulation of Zabbix agent 2 smartdisk plugin keys (for agent 1)."""
-import json, os, subprocess, sys, datetime
+import json, os, re, subprocess, sys, datetime
 
 TIMEOUT = 20
 INCLUDE_UNSUPPORTED = os.environ.get("SMART_INCLUDE_UNSUPPORTED") == "1"
@@ -181,6 +181,29 @@ def vendor_percentage_used(tbl):
                     return 100 - v
     return 0
 
+def devstat_percentage_used_text(path, raidtype=None):
+    """Last-resort for smartctl builds that omit ata_device_statistics from
+    JSON (e.g. some FreeBSD builds) but print the Device Statistics table in
+    text output:
+      0x07  0x008  1              47  N--  Percentage Used Endurance Indicator
+    """
+    cmd = SUDO + ["smartctl", "--all", path]
+    if raidtype:
+        cmd[len(SUDO) + 1:len(SUDO) + 1] = ["-d", raidtype]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT)
+    except Exception as e:
+        log("devstat_percentage_used_text(%s) EXC %r" % (path, e))
+        return 0
+    for line in p.stdout.splitlines():
+        m = re.match(r"\s*0x07\s+0x008\s+\d+\s+(\d+)\s+\S*\s+Percentage Used Endurance Indicator", line)
+        if m:
+            try:
+                return int(m.group(1))
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
 def get(path, raidtype=None):
     j, rc = smartctl_json(path, raidtype)
     if (j is not None and "json_format_version" in j and not is_smart_ok(j)
@@ -219,6 +242,10 @@ def get(path, raidtype=None):
         res["percentage_used"] = ata_percentage_used(j)
     if res["percentage_used"] == 0:
         res["percentage_used"] = vendor_percentage_used(ata)
+    if res["percentage_used"] == 0:
+        # smartctl build without ata_device_statistics in JSON (FreeBSD local
+        # builds) — parse the same value from the text Device Statistics table
+        res["percentage_used"] = devstat_percentage_used_text(path, raidtype)
     res["media_errors"] = int(nvme.get("media_errors") or j.get("scsi_error_counter_log", {}).get("read", {}).get("errors_corrected_by_eccfast", 0) or 0)
     res["self_test_passed"] = "yes"
     stl = j.get("self_test", {}).get("self_test_log", [])
