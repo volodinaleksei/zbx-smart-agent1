@@ -184,10 +184,10 @@ def vendor_percentage_used(tbl):
 def devstat_percentage_used_text(path, raidtype=None):
     """Last-resort for smartctl builds that omit ata_device_statistics from
     JSON (e.g. some FreeBSD builds) but print the Device Statistics table in
-    text output:
+    extended (-x) text output; -a does NOT include it there:
       0x07  0x008  1              47  N--  Percentage Used Endurance Indicator
     """
-    cmd = SUDO + ["smartctl", "--all", path]
+    cmd = SUDO + ["smartctl", "-x", path]
     if raidtype:
         cmd[len(SUDO) + 1:len(SUDO) + 1] = ["-d", raidtype]
     try:
